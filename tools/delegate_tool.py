@@ -1237,7 +1237,7 @@ def _build_child_agent(
         provider_sort=child_provider_sort,
         openrouter_min_coding_score=child_openrouter_min_coding_score,
         tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
+        iteration_budget=None,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
@@ -2072,6 +2072,7 @@ def delegate_task(
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[Dict[str, str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2216,23 +2217,47 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            # Resolve per-call model override
+            from tools.cronjob_tools import _resolve_model_override
+            per_call_provider, per_call_model = _resolve_model_override(model)
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model override (from tasks array or top-level)
+            task_model_obj = t.get("model") or model
+            task_provider, task_model_name = _resolve_model_override(task_model_obj)
+
+            # If per-call model is provided, don't use delegation config overrides —
+            # inherit from parent (which has the right credentials for the target provider)
+            if task_model_name:
+                child_model = task_model_name
+                # When a per-call model is provided, skip delegation config overrides
+                # so the child inherits the parent's provider credentials
+                child_provider = task_provider  # may be None → inherit from parent
+                child_base_url = None  # inherit from parent
+                child_api_key = None  # inherit from parent
+                child_api_mode = None  # inherit from parent
+            else:
+                child_model = creds["model"]
+                child_provider = creds["provider"]
+                child_base_url = creds["base_url"]
+                child_api_key = creds["api_key"]
+                child_api_mode = creds["api_mode"]
+
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
                 toolsets=t.get("toolsets") or toolsets,
-                model=creds["model"],
+                model=child_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
+                override_provider=child_provider,
+                override_base_url=child_base_url,
+                override_api_key=child_api_key,
+                override_api_mode=child_api_mode,
                 override_acp_command=t.get("acp_command")
                 or acp_command
                 or creds.get("command"),
@@ -3009,6 +3034,28 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "model": {
+                "type": "object",
+                "description": (
+                    "Optional per-call model override for the subagent. "
+                    "Pass {provider: 'openrouter', model: 'google/gemini-2.5-pro'} to route "
+                    "this subagent to a different model than the delegation config default. "
+                    "When provider is omitted, the current main provider is pinned. "
+                    "When set, the child inherits the parent's provider credentials "
+                    "instead of the delegation config credentials."
+                ),
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name (e.g. 'openrouter', 'anthropic'). Omit to pin current main provider.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name (e.g. 'google/gemini-2.5-pro', 'anthropic/claude-sonnet-4')",
+                    },
+                },
+                "required": ["model"],
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3042,6 +3089,15 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "object",
+                            "description": "Per-task model override. See top-level 'model' for semantics.",
+                            "properties": {
+                                "provider": {"type": "string"},
+                                "model": {"type": "string"},
+                            },
+                            "required": ["model"],
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3071,7 +3127,28 @@ DELEGATE_TASK_SCHEMA = {
                     "the user shouldn't have to wait on (research, builds, "
                     "multi-step investigations). Do NOT poll or wait after "
                     "dispatching — just continue; the result will come to you."
+            ),
+            },
+            "model": {
+                "type": "object",
+                "description": (
+                    "Optional per-call model override for the subagent. "
+                    "Pass {provider: 'openrouter', model: 'google/gemini-2.5-pro'} to route "
+                    "this subagent to a different model. When provider is omitted, the current "
+                    "main provider is pinned. When set, the child inherits the parent's provider "
+                    "credentials instead of the delegation config."
                 ),
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider name (e.g. 'openrouter', 'anthropic'). Omit to pin current main provider.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name (e.g. 'google/gemini-2.5-pro', 'anthropic/claude-sonnet-4')",
+                    },
+                },
+                "required": ["model"],
             },
             "acp_command": {
                 "type": "string",
@@ -3118,6 +3195,7 @@ registry.register(
         acp_args=args.get("acp_args"),
         role=args.get("role"),
         background=args.get("background"),
+        model=args.get("model"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
